@@ -1,2 +1,4 @@
 .venv/
 training/
+__pycache__/
+captured_images/
