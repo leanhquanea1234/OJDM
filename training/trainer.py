@@ -3,11 +3,12 @@ from ultralytics import YOLO
 
 model = YOLO("yolo26n.pt")
 
-# TODO: take pics, label and train model
-# results = model.train(data="NOT_AVALABLE", epochs=100, imgsz=640)
+model.train(data="datasets/orange-juice/data.yaml")
 
+"""
 trained_model = YOLO("runs/detect/train/weights/best.pt")
 
 results = trained_model("./people.jpg")
 print(results[0].names)
+"""
 

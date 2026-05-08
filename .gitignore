@@ -1,4 +1,12 @@
 .venv/
-training/
 __pycache__/
 captured_images/
+
+training/*.pt
+training/runs/
+# i do not want to leak my personal info so..
+training/datasets/
+
+# will update when i complete the training
+OJ_model*.pt
+
