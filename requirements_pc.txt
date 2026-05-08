@@ -1,3 +1,4 @@
 ultralytics
 numpy
 opencv-python
+PyGObject
