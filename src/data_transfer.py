@@ -497,7 +497,9 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
     Pi-side receiver for feedback downlink (audio RTP + display UDP).
     """
 
-    _THREAD_JOIN_TIMEOUT_SEC = 5
+    _THREAD_JOIN_TIMEOUT_SECONDS = 5
+    _DISPLAY_SOCKET_TIMEOUT_SECONDS = 0.5
+    _BIT_CHARS = {ord("0"), ord("1")}
 
     def __init__(
         self,
@@ -531,7 +533,7 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
             return packet
 
         # Optional compatibility path: incoming ASCII bit string.
-        if len(packet) == self._cfg.DISPLAY_BYTES * 8 and set(packet) <= {48, 49}:
+        if len(packet) == self._cfg.DISPLAY_BYTES * 8 and set(packet) <= self._BIT_CHARS:
             return bytes(
                 int(packet[i:i + 8].decode("ascii"), 2)
                 for i in range(0, len(packet), 8)
@@ -573,7 +575,7 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
         self._display_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._display_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._display_sock.bind((self._bind_host, self._cfg.DISPLAY_PORT))
-        self._display_sock.settimeout(0.5)
+        self._display_sock.settimeout(self._DISPLAY_SOCKET_TIMEOUT_SECONDS)
 
         self._display_thread = threading.Thread(
             target=self._display_recv_loop,
@@ -597,7 +599,7 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
             self._display_sock = None
 
         if self._display_thread is not None:
-            self._display_thread.join(timeout=self._THREAD_JOIN_TIMEOUT_SEC)
+            self._display_thread.join(timeout=self._THREAD_JOIN_TIMEOUT_SECONDS)
             if self._display_thread.is_alive():
                 logger.warning("FeedbackReceiver: display thread did not exit within timeout")
             self._display_thread = None
