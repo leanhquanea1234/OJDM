@@ -388,12 +388,17 @@ class FeedbackSender(_GstRunner, FeedbackTransferer):
             self._display_sock.close()
             self._display_sock = None
 
-        for tmp_path in list(self._temp_audio_paths):
+        with self._lock:
+            temp_paths = list(self._temp_audio_paths)
+
+        for tmp_path in temp_paths:
             try:
                 os.unlink(tmp_path)
             except FileNotFoundError:
                 pass
-            finally:
+
+        with self._lock:
+            for tmp_path in temp_paths:
                 self._temp_audio_paths.discard(tmp_path)
 
         logger.info("FeedbackSender stopped")
@@ -434,7 +439,8 @@ class FeedbackSender(_GstRunner, FeedbackTransferer):
                 f.write(opus_source)
                 temp_path = f.name
 
-            self._temp_audio_paths.add(temp_path)
+            with self._lock:
+                self._temp_audio_paths.add(temp_path)
             self.send_audio_file(temp_path)
         except Exception:
             if temp_path is not None:
@@ -442,6 +448,8 @@ class FeedbackSender(_GstRunner, FeedbackTransferer):
                     os.unlink(temp_path)
                 except FileNotFoundError:
                     pass
+                with self._lock:
+                    self._temp_audio_paths.discard(temp_path)
             raise
 
     def _bitstring_to_display_bytes(self, bit_string: str) -> bytes:
@@ -487,7 +495,8 @@ class FeedbackSender(_GstRunner, FeedbackTransferer):
             self.start()
 
         payload = self._parse_display_payload(frame_source)
-        assert self._display_sock is not None
+        if self._display_sock is None:
+            raise RuntimeError("FeedbackSender display socket is not initialized")
         self._display_sock.sendto(payload, (self._display_host, self._cfg.DISPLAY_PORT))
         logger.debug("FeedbackSender: sent display frame (%d bytes)", len(payload))
 
@@ -533,7 +542,7 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
             return packet
 
         # Optional compatibility path: incoming ASCII bit string.
-        if len(packet) == self._cfg.DISPLAY_BYTES * 8 and set(packet) <= self._BIT_CHARS:
+        if len(packet) == self._cfg.DISPLAY_BYTES * 8 and all(b in self._BIT_CHARS for b in packet):
             return bytes(
                 int(packet[i:i + 8].decode("ascii"), 2)
                 for i in range(0, len(packet), 8)
