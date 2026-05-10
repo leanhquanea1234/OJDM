@@ -373,8 +373,10 @@ class FeedbackSender(_GstRunner, FeedbackTransferer):
         self._temp_audio_paths: set[str] = set()
 
     def start(self) -> None:
-        if self._display_sock is None:
-            self._display_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if self._display_sock is not None:
+            return
+
+        self._display_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         logger.info(
             "FeedbackSender started (audio RTP → %s:%d, display UDP → %s:%d)",
             self._pi_host, self._cfg.AUDIO_PORT, self._display_host, self._cfg.DISPLAY_PORT,
@@ -553,6 +555,9 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
                     logger.exception("FeedbackReceiver: display_callback raised an exception")
 
     def start(self) -> None:
+        if self._display_sock is not None:
+            return
+
         self._start_pipeline(self._build_audio_pipeline_str())
 
         self._display_stop.clear()
