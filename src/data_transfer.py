@@ -18,7 +18,11 @@ loop is run on a dedicated daemon thread; user code only calls
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import threading
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -340,4 +344,274 @@ class VideoReceiver(_GstRunner, VideoTransferer):
         with self._frame_lock:
             return self._latest_frame
 
-# TODO: FeedbackTransferer
+class FeedbackSender(_GstRunner, FeedbackTransferer):
+    """
+    PC-side sender for feedback downlink (audio + display) over UDP.
+
+    Audio
+    -----
+    Sends Opus RTP to the Pi from ``.opus`` files using GStreamer:
+    ``filesrc ! oggdemux ! opusparse ! rtpopuspay ! udpsink``.
+
+    Display
+    -------
+    Sends a single UDP datagram per frame with exactly
+    ``FeedbackConfig.DISPLAY_BYTES`` bytes (packed 1-bit pixels).
+    """
+
+    def __init__(
+        self,
+        pi_host: str,
+        cfg: FeedbackConfig = FeedbackConfig(),
+        display_host: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self._pi_host = pi_host
+        self._display_host = display_host or pi_host
+        self._cfg = cfg
+        self._display_sock: Optional[socket.socket] = None
+        self._temp_audio_paths: set[str] = set()
+
+    def start(self) -> None:
+        if self._display_sock is not None:
+            return
+
+        self._display_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        logger.info(
+            "FeedbackSender started (audio RTP → %s:%d, display UDP → %s:%d)",
+            self._pi_host, self._cfg.AUDIO_PORT, self._display_host, self._cfg.DISPLAY_PORT,
+        )
+
+    def stop(self) -> None:
+        self._stop_pipeline()
+        if self._display_sock is not None:
+            self._display_sock.close()
+            self._display_sock = None
+
+        with self._lock:
+            temp_paths = list(self._temp_audio_paths)
+
+        for tmp_path in temp_paths:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+        with self._lock:
+            for tmp_path in temp_paths:
+                self._temp_audio_paths.discard(tmp_path)
+
+        logger.info("FeedbackSender stopped")
+
+    def _build_audio_file_pipeline(self, opus_file: Path) -> str:
+        return (
+            f'filesrc location="{opus_file}" ! '
+            "oggdemux ! opusparse ! rtpopuspay pt=96 ! "
+            f"udpsink host={self._pi_host} port={self._cfg.AUDIO_PORT}"
+        )
+
+    def send_audio_file(self, opus_path: str | Path) -> None:
+        """
+        Stream a local ``.opus`` file to the Pi speaker over RTP/Opus.
+        """
+        path = Path(opus_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Opus file not found: {path}")
+
+        self._stop_pipeline()
+        self._start_pipeline(self._build_audio_file_pipeline(path))
+        logger.debug("FeedbackSender: streaming audio file %s", path)
+
+    def send_audio(self, opus_source: bytes | bytearray | str | Path) -> None:
+        """
+        Send audio feedback from either an Opus file path or raw ``.opus`` bytes.
+        """
+        if isinstance(opus_source, (str, Path)):
+            self.send_audio_file(opus_source)
+            return
+
+        if not isinstance(opus_source, (bytes, bytearray)):
+            raise TypeError("opus_source must be bytes, bytearray, str, or Path")
+
+        temp_path: Optional[str] = None
+        try:
+            with NamedTemporaryFile("wb", suffix=".opus", delete=False) as f:
+                f.write(opus_source)
+                temp_path = f.name
+
+            with self._lock:
+                self._temp_audio_paths.add(temp_path)
+            self.send_audio_file(temp_path)
+        except Exception:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+                with self._lock:
+                    self._temp_audio_paths.discard(temp_path)
+            raise
+
+    def _bitstring_to_display_bytes(self, bit_string: str) -> bytes:
+        cleaned = "".join(ch for ch in bit_string.strip() if ch in ("0", "1"))
+        expected_bits = self._cfg.DISPLAY_BYTES * 8
+        if len(cleaned) != expected_bits:
+            raise ValueError(
+                f"Display bit string must contain exactly {expected_bits} bits, got {len(cleaned)}"
+            )
+
+        out = bytearray(self._cfg.DISPLAY_BYTES)
+        for byte_idx, i in enumerate(range(0, len(cleaned), 8)):
+            out[byte_idx] = int(cleaned[i:i + 8], 2)
+        return bytes(out)
+
+    def _parse_display_payload(self, frame_source: bytes | bytearray | str | Path) -> bytes:
+        if isinstance(frame_source, (bytes, bytearray)):
+            payload = bytes(frame_source)
+            if len(payload) != self._cfg.DISPLAY_BYTES:
+                raise ValueError(
+                    f"Display payload must be {self._cfg.DISPLAY_BYTES} bytes, got {len(payload)}"
+                )
+            return payload
+
+        if isinstance(frame_source, Path):
+            text = frame_source.read_text(encoding="utf-8")
+            return self._bitstring_to_display_bytes(text)
+
+        if isinstance(frame_source, str):
+            maybe_path = Path(frame_source)
+            if maybe_path.exists():
+                text = maybe_path.read_text(encoding="utf-8")
+                return self._bitstring_to_display_bytes(text)
+            return self._bitstring_to_display_bytes(frame_source)
+
+        raise TypeError("frame_source must be bytes, bytearray, str, or Path")
+
+    def send_display(self, frame_source: bytes | bytearray | str | Path) -> None:
+        """
+        Send one 128×64 monochrome frame to the Pi OLED via UDP.
+        """
+        if self._display_sock is None:
+            self.start()
+
+        payload = self._parse_display_payload(frame_source)
+        if self._display_sock is None:
+            raise RuntimeError("FeedbackSender display socket is not initialized")
+        self._display_sock.sendto(payload, (self._display_host, self._cfg.DISPLAY_PORT))
+        logger.debug("FeedbackSender: sent display frame (%d bytes)", len(payload))
+
+
+class FeedbackReceiver(_GstRunner, FeedbackTransferer):
+    """
+    Pi-side receiver for feedback downlink (audio RTP + display UDP).
+    """
+
+    _THREAD_JOIN_TIMEOUT_SECONDS = 5
+    _DISPLAY_SOCKET_TIMEOUT_SECONDS = 0.5
+    _BIT_CHARS = {ord("0"), ord("1")}
+
+    def __init__(
+        self,
+        cfg: FeedbackConfig = FeedbackConfig(),
+        bind_host: str = "0.0.0.0",
+        display_callback: Optional[Callable[[bytes], None]] = None,
+        audio_sink: str = "autoaudiosink",
+    ) -> None:
+        super().__init__()
+        self._cfg = cfg
+        self._bind_host = bind_host
+        self._display_callback = display_callback
+        self._audio_sink = audio_sink
+
+        self._display_sock: Optional[socket.socket] = None
+        self._display_thread: Optional[threading.Thread] = None
+        self._display_stop = threading.Event()
+
+    def _build_audio_pipeline_str(self) -> str:
+        return (
+            f"udpsrc port={self._cfg.AUDIO_PORT} "
+            'caps="application/x-rtp,media=(string)audio,clock-rate=(int)48000,'
+            'encoding-name=(string)OPUS,payload=(int)96" ! '
+            "rtpjitterbuffer latency=100 ! rtpopusdepay ! opusdec ! "
+            "audioconvert ! audioresample ! "
+            f"{self._audio_sink} sync=false"
+        )
+
+    def _decode_display_packet(self, packet: bytes) -> Optional[bytes]:
+        if len(packet) == self._cfg.DISPLAY_BYTES:
+            return packet
+
+        # Optional compatibility path: incoming ASCII bit string.
+        if len(packet) == self._cfg.DISPLAY_BYTES * 8 and all(b in self._BIT_CHARS for b in packet):
+            return bytes(
+                int(packet[i:i + 8].decode("ascii"), 2)
+                for i in range(0, len(packet), 8)
+            )
+
+        return None
+
+    def _display_recv_loop(self) -> None:
+        assert self._display_sock is not None
+        while not self._display_stop.is_set():
+            try:
+                data, _addr = self._display_sock.recvfrom(self._cfg.DISPLAY_BYTES * 8)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            frame_bytes = self._decode_display_packet(data)
+            if frame_bytes is None:
+                logger.warning(
+                    "FeedbackReceiver: dropped display datagram of unsupported size %d",
+                    len(data),
+                )
+                continue
+
+            if self._display_callback is not None:
+                try:
+                    self._display_callback(frame_bytes)
+                except Exception:
+                    logger.exception("FeedbackReceiver: display_callback raised an exception")
+
+    def start(self) -> None:
+        if self._display_sock is not None:
+            return
+
+        self._start_pipeline(self._build_audio_pipeline_str())
+
+        self._display_stop.clear()
+        self._display_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._display_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._display_sock.bind((self._bind_host, self._cfg.DISPLAY_PORT))
+        self._display_sock.settimeout(self._DISPLAY_SOCKET_TIMEOUT_SECONDS)
+
+        self._display_thread = threading.Thread(
+            target=self._display_recv_loop,
+            name="FeedbackReceiver-display",
+            daemon=True,
+        )
+        self._display_thread.start()
+
+        logger.info(
+            "FeedbackReceiver started (audio UDP/RTP :%d, display UDP %s:%d)",
+            self._cfg.AUDIO_PORT,
+            self._bind_host,
+            self._cfg.DISPLAY_PORT,
+        )
+
+    def stop(self) -> None:
+        self._display_stop.set()
+
+        if self._display_sock is not None:
+            self._display_sock.close()
+            self._display_sock = None
+
+        if self._display_thread is not None:
+            self._display_thread.join(timeout=self._THREAD_JOIN_TIMEOUT_SECONDS)
+            if self._display_thread.is_alive():
+                logger.warning("FeedbackReceiver: display thread did not exit within timeout")
+            self._display_thread = None
+
+        self._stop_pipeline()
+        logger.info("FeedbackReceiver stopped")
