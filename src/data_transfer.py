@@ -426,7 +426,7 @@ class FeedbackSender(_GstRunner, FeedbackTransferer):
         if not isinstance(opus_source, (bytes, bytearray)):
             raise TypeError("opus_source must be bytes, bytearray, str, or Path")
 
-        with NamedTemporaryFile("wb", suffix=".opus", dir="/tmp", delete=False) as f:
+        with NamedTemporaryFile("wb", suffix=".opus", delete=False) as f:
             f.write(opus_source)
             temp_path = f.name
 
@@ -486,6 +486,8 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
     Pi-side receiver for feedback downlink (audio RTP + display UDP).
     """
 
+    _THREAD_JOIN_TIMEOUT_SEC = 5
+
     def __init__(
         self,
         cfg: FeedbackConfig = FeedbackConfig(),
@@ -519,7 +521,10 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
 
         # Optional compatibility path: incoming ASCII bit string.
         if len(packet) == self._cfg.DISPLAY_BYTES * 8 and set(packet) <= {48, 49}:
-            return bytes(int(packet[i:i + 8], 2) for i in range(0, len(packet), 8))
+            return bytes(
+                int(packet[i:i + 8].decode("ascii"), 2)
+                for i in range(0, len(packet), 8)
+            )
 
         return None
 
@@ -527,7 +532,7 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
         assert self._display_sock is not None
         while not self._display_stop.is_set():
             try:
-                data, _addr = self._display_sock.recvfrom(max(65535, self._cfg.DISPLAY_BYTES * 8))
+                data, _addr = self._display_sock.recvfrom(self._cfg.DISPLAY_BYTES * 8)
             except socket.timeout:
                 continue
             except OSError:
@@ -578,7 +583,7 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
             self._display_sock = None
 
         if self._display_thread is not None:
-            self._display_thread.join(timeout=5)
+            self._display_thread.join(timeout=self._THREAD_JOIN_TIMEOUT_SEC)
             self._display_thread = None
 
         self._stop_pipeline()
