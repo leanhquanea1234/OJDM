@@ -428,12 +428,21 @@ class FeedbackSender(_GstRunner, FeedbackTransferer):
         if not isinstance(opus_source, (bytes, bytearray)):
             raise TypeError("opus_source must be bytes, bytearray, str, or Path")
 
-        with NamedTemporaryFile("wb", suffix=".opus", delete=False) as f:
-            f.write(opus_source)
-            temp_path = f.name
+        temp_path: Optional[str] = None
+        try:
+            with NamedTemporaryFile("wb", suffix=".opus", delete=False) as f:
+                f.write(opus_source)
+                temp_path = f.name
 
-        self._temp_audio_paths.add(temp_path)
-        self.send_audio_file(temp_path)
+            self._temp_audio_paths.add(temp_path)
+            self.send_audio_file(temp_path)
+        except Exception:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+            raise
 
     def _bitstring_to_display_bytes(self, bit_string: str) -> bytes:
         cleaned = "".join(ch for ch in bit_string.strip() if ch in ("0", "1"))
@@ -444,8 +453,8 @@ class FeedbackSender(_GstRunner, FeedbackTransferer):
             )
 
         out = bytearray(self._cfg.DISPLAY_BYTES)
-        for i in range(0, len(cleaned), 8):
-            out[i // 8] = int(cleaned[i:i + 8], 2)
+        for byte_idx, i in enumerate(range(0, len(cleaned), 8)):
+            out[byte_idx] = int(cleaned[i:i + 8], 2)
         return bytes(out)
 
     def _parse_display_payload(self, frame_source: bytes | bytearray | str | Path) -> bytes:
@@ -589,6 +598,8 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
 
         if self._display_thread is not None:
             self._display_thread.join(timeout=self._THREAD_JOIN_TIMEOUT_SEC)
+            if self._display_thread.is_alive():
+                logger.warning("FeedbackReceiver: display thread did not exit within timeout")
             self._display_thread = None
 
         self._stop_pipeline()
