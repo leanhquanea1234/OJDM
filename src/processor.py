@@ -3,47 +3,61 @@ processor.py
 ============
 PC-side processing pipeline for the Orange Juice Detection Machine (OJDM).
 
-Two main components
--------------------
-* **Detector** — wraps an Ultralytics YOLO model and runs inference on
-  incoming BGR video frames received from the Pi.
-* **Decider** — interprets detection results and decides which feedback
-  actions to trigger (audio alert, OLED display update, etc.).
+Features
+--------
+* Receives frames from the Pi via VideoReceiver.
+* Runs YOLO detection via Detector.
+* Sends random Opus audio clips from:
+    - assets/sounds/detected/*.opus (when detection present)
+    - assets/sounds/idle/*.opus (periodically when idle)
+* Sends OLED display frames based on state:
+    - assets/faces/love (when detection present)
+    - assets/faces/idle (when idle)
+* Optional debug GUI (Tkinter) with detection boxes.
 
-Typical data flow on the PC side
----------------------------------
-::
+Expected asset layout
+---------------------
+assets/
+  sounds/
+    idle/*.opus
+    detected/*.opus
+  faces/
+    idle        (1024 bytes raw framebuffer)
+    love        (1024 bytes raw framebuffer)
 
-    VideoReceiver.frame_callback
-           │
-           ▼
-    Detector.detect(frame)         → list[Detection]
-           │
-           ▼
-    Decider.evaluate(detections)   → ActionSet
-           │
-           ├──► FeedbackSender.send_audio(opus_bytes)   (if play_audio)
-           └──► FeedbackSender.send_display(frame_bytes) (if update_display)
+Usage
+-----
+python3 processor.py --pi-host 192.168.1.50 --model ./OJ_model_v1.pt --debug-gui
+
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
+import random
 import threading
+import time
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
+from data_transfer import VideoConfig, FeedbackSender, VideoReceiver
+
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Shared data structures
+# Constants
 # ---------------------------------------------------------------------------
 
-# Byte count of the 128×64 1-bit OLED framebuffer used by Decider.
-_DISPLAY_BYTES: int = 128 * 64 // 8  # 1024
+DISPLAY_BYTES = 128 * 64 // 8  # 1024
+BASE_DIR = Path(__file__).resolve().parent  # ../src
+ASSETS_DIR = BASE_DIR.parent / "assets"
 
 
 @dataclass
@@ -128,30 +142,6 @@ class IDetector(ABC):
             Possibly-empty list of detections found in the frame,
             ordered by confidence (highest first).
         """
-
-
-class IDecider(ABC):
-    """
-    Interface for deciding which feedback actions to perform based on
-    detection results.
-    """
-
-    @abstractmethod
-    def evaluate(self, detections: list[Detection]) -> ActionSet:
-        """
-        Determine what actions to take given the current detections.
-
-        Parameters
-        ----------
-        detections : list[Detection]
-            Output from ``IDetector.detect()``.
-
-        Returns
-        -------
-        ActionSet
-            The actions that should be executed this cycle.
-        """
-
 
 # ---------------------------------------------------------------------------
 # Concrete: Detector
@@ -270,151 +260,327 @@ class Detector(IDetector):
 
 
 # ---------------------------------------------------------------------------
-# Concrete: Decider
+# Frame buffer (thread-safe)
 # ---------------------------------------------------------------------------
 
-class Decider(IDecider):
-    """
-    Rule-based action decider for orange-juice detections.
+class FrameBuffer:
+    def __init__(self) -> None:
+        self._frame: Optional[np.ndarray] = None
+        self._lock = threading.Lock()
 
-    Decision logic
-    --------------
-    * If any detection matches ``target_class`` **and** its confidence
-      is ≥ ``alert_confidence``, ``ActionSet.play_audio`` is set to
-      ``True`` with ``audio_label = "alert"``.
-    * ``ActionSet.update_display`` is ``True`` whenever there are any
-      detections at all, so the OLED reflects the live detection state.
-    * The display framebuffer is a minimal 128×64 1-bit image whose filled
-      rows are proportional to the number of target-class detections
-      (see ``_build_display_frame()``).
+    def update(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._frame = frame.copy()
 
-    Parameters
-    ----------
-    target_class : str
-        The detection class name to monitor (e.g. ``"orange_juice"``).
-    alert_confidence : float
-        Minimum confidence required to trigger an audio alert.
-        Must be in the range ``[0, 1]``.  Default is ``0.6``.
+    def get(self) -> Optional[np.ndarray]:
+        with self._lock:
+            if self._frame is None:
+                return None
+            return self._frame.copy()
 
-    Example
-    -------
-    >>> decider = Decider(target_class="orange_juice")
-    >>> actions = decider.evaluate(detections)
-    >>> if actions.play_audio:
-    ...     feedback_sender.send_audio(audio_clips["alert"])
-    >>> if actions.update_display:
-    ...     feedback_sender.send_display(actions.display_frame)
-    """
 
-    def __init__(
-        self,
-        target_class: str = "orange_juice",
-        alert_confidence: float = 0.6,
-    ) -> None:
-        self._target_class = target_class
-        self._alert_confidence = alert_confidence
+# ---------------------------------------------------------------------------
+# Asset loading helpers
+# ---------------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    def evaluate(self, detections: list[Detection]) -> ActionSet:
-        """
-        Map a list of detections to a concrete set of feedback actions.
+@dataclass
+class AudioPools:
+    idle: list[Path]
+    detected: list[Path]
 
-        Parameters
-        ----------
-        detections : list[Detection]
-            Output from ``Detector.detect()``.
+    def random_idle(self) -> Optional[Path]:
+        return random.choice(self.idle) if self.idle else None
 
-        Returns
-        -------
-        ActionSet
-            * ``play_audio`` is ``True`` iff at least one detection has
-              ``class_name == target_class`` and
-              ``confidence >= alert_confidence``.
-            * ``update_display`` is ``True`` iff ``detections`` is
-              non-empty.
-            * ``display_frame`` contains the 1024-byte framebuffer when
-              ``update_display`` is ``True``, otherwise ``None``.
-        """
-        actions = ActionSet(detections=detections)
+    def random_detected(self) -> Optional[Path]:
+        return random.choice(self.detected) if self.detected else None
 
-        target_hits = [
-            d for d in detections
-            if d.class_name == self._target_class
-            and d.confidence >= self._alert_confidence
-        ]
 
-        if target_hits:
-            actions.play_audio = True
-            actions.audio_label = "alert"
-            logger.info(
-                "Decider: %d high-confidence '%s' detection(s) → audio alert",
-                len(target_hits), self._target_class,
-            )
+@dataclass
+class FaceFrames:
+    idle: bytes
+    love: bytes
 
-        if detections:
-            actions.update_display = True
-            actions.display_frame = self._build_display_frame(detections)
 
-        return actions
+def _load_audio_pools(base: Path) -> AudioPools:
+    idle_dir = base / "idle"
+    detected_dir = base / "detected"
 
-    # ------------------------------------------------------------------
-    def _build_display_frame(self, detections: list[Detection]) -> bytes:
-        """
-        Build a 1024-byte 128×64 monochrome framebuffer summarising the
-        current detections.
+    idle = sorted(p for p in idle_dir.glob("*.opus") if p.is_file())
+    detected = sorted(p for p in detected_dir.glob("*.opus") if p.is_file())
 
-        The framebuffer uses a simple bar-chart metaphor: for each target-
-        class detection, 8 additional rows at the top of the display are
-        filled white (max 8 detections × 8 rows = 64 rows = full display).
-        All other pixels are black.
+    logger.info("Loaded %d idle audio clips, %d detected clips", len(idle), len(detected))
+    return AudioPools(idle=idle, detected=detected)
 
-        Parameters
-        ----------
-        detections : list[Detection]
-            Current detections (any class).
-
-        Returns
-        -------
-        bytes
-            Exactly ``_DISPLAY_BYTES`` (1024) bytes of packed 1-bit pixel
-            data, row-major, MSB-first within each byte.
-
-        Notes
-        -----
-        This is a placeholder visualisation.  A proper bitmap font
-        renderer (see TODO list) should replace or augment this once a
-        font library is integrated.
-        """
-        # 128 columns × 64 rows; each byte encodes 8 horizontal pixels.
-        buf = bytearray(_DISPLAY_BYTES)  # all pixels off (black)
-
-        target_count = sum(
-            1 for d in detections if d.class_name == self._target_class
+def _bitstring_to_display_bytes(bit_string: str) -> bytes:
+    cleaned = "".join(ch for ch in bit_string.strip() if ch in ("0", "1"))
+    expected_bits = DISPLAY_BYTES * 8  # 8192
+    if len(cleaned) != expected_bits:
+        raise ValueError(
+            f"Display bit string must contain exactly {expected_bits} bits, got {len(cleaned)}"
         )
 
-        # Fill top N rows (8 rows per detected target, capped at 64 rows).
-        fill_rows = min(target_count * 8, 64)
-        for row in range(fill_rows):
-            byte_offset = row * (128 // 8)  # 16 bytes per row
-            for col_byte in range(128 // 8):
-                buf[byte_offset + col_byte] = 0xFF  # all 8 pixels on
+    out = bytearray(DISPLAY_BYTES)
+    for byte_idx, i in enumerate(range(0, len(cleaned), 8)):
+        out[byte_idx] = int(cleaned[i:i + 8], 2)
+    return bytes(out)
 
-        return bytes(buf)
+
+#TODO: more logic on face thingies
+def _load_face_frames(faces_dir: Path) -> FaceFrames:
+    idle_path = faces_dir / "idle"
+    love_path = faces_dir / "love"
+
+    idle_raw = idle_path.read_bytes()
+    love_raw = love_path.read_bytes()
+
+    if len(idle_raw) == DISPLAY_BYTES and len(love_raw) == DISPLAY_BYTES:
+        return FaceFrames(idle=idle_raw, love=love_raw)
+
+    # Treat as ASCII bitstrings
+    idle_text = idle_raw.decode("utf-8")
+    love_text = love_raw.decode("utf-8")
+    idle = _bitstring_to_display_bytes(idle_text)
+    love = _bitstring_to_display_bytes(love_text)
+    return FaceFrames(idle=idle, love=love)
 
 
 # ---------------------------------------------------------------------------
-# TODO — next steps
+# Debug GUI (optional)
 # ---------------------------------------------------------------------------
-# 1. [Detector]  Collect orange-juice images, annotate bounding boxes, and
-#    train/fine-tune a YOLO model (replace the placeholder in detector.py).
-# 2. [Detector]  Benchmark inference time on the PC; if GPU is available,
-#    switch device to "cuda" for faster throughput.
-# 3. [Decider]   Integrate a bitmap font library (e.g. Pillow) so that
-#    _build_display_frame() renders readable text (count, confidence %).
-# 4. [Decider]   Load audio clips (Opus format) from a config file rather
-#    than hard-coding the "alert" label.
-# 5. [General]   Implement a main PC loop that wires VideoReceiver,
-#    Detector, Decider, and FeedbackSender together in a single process.
-# 6. [General]   Add logging configuration (rotating file handler) for
-#    production deployment.
+
+class DebugGUI:
+    def __init__(self, frame_buffer: FrameBuffer, detector: Detector) -> None:
+        import tkinter as tk
+        from tkinter import ttk
+        from PIL import Image, ImageTk, ImageDraw, ImageFont
+
+        self._tk = tk
+        self._ttk = ttk
+        self._Image = Image
+        self._ImageTk = ImageTk
+        self._ImageDraw = ImageDraw
+        self._ImageFont = ImageFont
+
+        self._frame_buffer = frame_buffer
+        self._detector = detector
+        self._running = True
+
+        self.root = tk.Tk()
+        self.root.title("Detector Debug")
+        self.root.geometry("900x700")
+
+        self.video_label = tk.Label(self.root, bg="black")
+        self.video_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.status_label = ttk.Label(control_frame, text="Waiting for frames...")
+        self.status_label.pack(side=tk.LEFT, padx=5)
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_stop)
+        self._poll_and_display()
+
+    def _poll_and_display(self) -> None:
+        frame = self._frame_buffer.get()
+        if frame is not None:
+            detections = self._detector.detect(frame)
+
+            rgb = frame[..., ::-1]
+            img = self._Image.fromarray(rgb)
+            draw = self._ImageDraw.Draw(img)
+
+            try:
+                font = self._ImageFont.truetype("arial.ttf", 14)
+            except Exception:
+                font = self._ImageFont.load_default()
+
+            for det in detections:
+                x1, y1, x2, y2 = det.bbox
+                label = f"{det.class_name} {det.confidence:.2f}"
+                draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+                text_box = draw.textbbox((0, 0), label, font=font)
+                tw = text_box[2] - text_box[0]
+                th = text_box[3] - text_box[1]
+                draw.rectangle([x1, y1 - th - 4, x1 + tw + 4, y1], fill="red")
+                draw.text((x1 + 2, y1 - th - 2), label, fill="white", font=font)
+
+            img.thumbnail((900, 700), self._Image.Resampling.LANCZOS)
+            photo = self._ImageTk.PhotoImage(img)
+            self.video_label.config(image=photo)
+            self.video_label.image = photo
+            self.status_label.config(text=f"Detections: {len(detections)}")
+
+        if self._running:
+            self.root.after(33, self._poll_and_display)
+
+    def _on_stop(self) -> None:
+        self._running = False
+        self.root.quit()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
 # ---------------------------------------------------------------------------
+# Main processing loop
+# ---------------------------------------------------------------------------
+
+class Processor:
+    def __init__(
+        self,
+        pi_host: str,
+        model_path: Path,
+        confidence_threshold: float,
+        device: str,
+        video_cfg: VideoConfig,
+        audio_pools: AudioPools,
+        face_frames: FaceFrames,
+        idle_interval_seconds: float,
+        debug_gui: bool,
+    ) -> None:
+        self._pi_host = pi_host
+        self._video_cfg = video_cfg
+        self._idle_interval = idle_interval_seconds
+
+        self._audio_pools = audio_pools
+        self._faces = face_frames
+
+        self._frame_buffer = FrameBuffer()
+        self._detector = Detector(
+            model_path=str(model_path),
+            confidence_threshold=confidence_threshold,
+            device=device,
+        )
+
+        self._receiver = VideoReceiver(
+            pi_host=self._pi_host,
+            cfg=self._video_cfg,
+            frame_callback=self._frame_buffer.update,
+        )
+        self._feedback = FeedbackSender(pi_host=self._pi_host)
+
+        self._last_idle_audio_time = 0.0
+        self._last_state_detected = False
+        self._debug_gui_enabled = debug_gui
+        self._debug_gui: Optional[DebugGUI] = None
+        self._stop_event = threading.Event()
+
+    def start(self) -> None:
+        self._receiver.start()
+        self._feedback.start()
+
+    def stop(self) -> None:
+        self._receiver.stop()
+        self._feedback.stop()
+
+    def _send_detected_feedback(self) -> None:
+        audio = self._audio_pools.random_detected()
+        if audio is not None:
+            self._feedback.send_audio(audio)
+        self._feedback.send_display(self._faces.love)
+
+    def _send_idle_feedback(self, now: float) -> None:
+        if now - self._last_idle_audio_time >= self._idle_interval:
+            audio = self._audio_pools.random_idle()
+            if audio is not None:
+                self._feedback.send_audio(audio)
+            self._last_idle_audio_time = now
+
+        if self._last_state_detected:
+            self._feedback.send_display(self._faces.idle)
+
+    def run_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                frame = self._frame_buffer.get()
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                detections = self._detector.detect(frame)
+                detected = len(detections) > 0
+
+                now = time.monotonic()
+                if detected:
+                    if not self._last_state_detected:
+                        self._send_detected_feedback()
+                    self._last_state_detected = True
+                else:
+                    self._send_idle_feedback(now)
+                    self._last_state_detected = False
+
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            logger.info("Processor interrupted by user")
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="PC-side processor for OJDM")
+    parser.add_argument("--pi-host", required=True, help="Pi hostname or IP")
+    parser.add_argument("--model", required=True, help="Path to YOLO .pt model")
+    parser.add_argument("--conf", type=float, default=0.5, help="Confidence threshold")
+    parser.add_argument("--device", default="cpu", help="Torch device (cpu/cuda/mps)")
+    parser.add_argument("--video-port", type=int, default=5000, help="Video TCP port")
+    parser.add_argument("--width", type=int, default=640, help="Video width")
+    parser.add_argument("--height", type=int, default=480, help="Video height")
+    parser.add_argument("--fps", type=int, default=10, help="Video FPS")
+    parser.add_argument("--idle-interval", type=float, default=40.0, help="Idle audio interval (s)")
+    parser.add_argument("--assets", default="assets", help="Assets base directory")
+    parser.add_argument("--debug-gui", action="store_true", help="Show debug GUI with boxes")
+    parser.add_argument("--log-level", default="INFO", help="Logging level")
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    assets = Path(args.assets)
+    audio_pools = _load_audio_pools(ASSETS_DIR / "sounds")
+    face_frames = _load_face_frames(ASSETS_DIR / "faces")
+
+    video_cfg = VideoConfig(
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+        port=args.video_port,
+    )
+
+    processor = Processor(
+        pi_host=args.pi_host,
+        model_path=Path(args.model),
+        confidence_threshold=args.conf,
+        device=args.device,
+        video_cfg=video_cfg,
+        audio_pools=audio_pools,
+        face_frames=face_frames,
+        idle_interval_seconds=args.idle_interval,
+        debug_gui=args.debug_gui,
+    )
+
+    processor.start()
+
+    if args.debug_gui:
+        worker = threading.Thread(target=processor.run_loop, daemon=True)
+        worker.start()
+
+        gui = DebugGUI(processor._frame_buffer, processor._detector)
+        try:
+            gui.run()  # MAIN THREAD
+        finally:
+            processor.stop()
+    else:
+        try:
+            processor.run_loop()
+        finally:
+            processor.stop()
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
