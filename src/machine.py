@@ -16,7 +16,7 @@ Typical usage
 -------------
 ::
 
-    node = PiNode(pc_host="192.168.1.50")
+    node = PiNode()
     node.run()        # starts both threads (non-blocking)
     try:
         signal.pause()    # keep the main thread alive
@@ -32,12 +32,19 @@ Dependencies (Pi-side only)
 """
 
 from __future__ import annotations
+import sys
+import argparse
+import signal
+from luma.core.interface.serial import i2c
+from luma.core.render import canvas
+from luma.oled.device import ssd1306, ssd1325, ssd1331, sh1106
+from time import sleep
 
 import logging
 import threading
 from abc import ABC, abstractmethod
 
-from data_transfer import VideoSender, FeedbackReceiver, FeedbackConfig
+from data_transfer import VideoConfig, FeedbackConfig, VideoSender, FeedbackReceiver
 
 logger = logging.getLogger(__name__)
 
@@ -79,15 +86,14 @@ class PiNode(IPiNode):
 
     Parameters
     ----------
-    pc_host : str
-        IP address (or resolvable hostname) of the PC running the
-        processor (``processor.py``).
-    camera_device : str
-        V4L2 device node for the camera.  Default ``"/dev/video0"``.
-    bind_host : str
-        Network interface to bind the display receive socket to.
-        Defaults to ``"0.0.0.0"`` (all interfaces).  Set to the Pi's own
-        WLAN IP to restrict display updates to the local subnet.
+    video_cfg : VideoConfig
+        Video uplink configuration (resolution, FPS, TCP port).
+    feedback_cfg : FeedbackConfig
+        Feedback downlink configuration (audio/display ports).
+    video_bind_host : str
+        TCP bind host for the video server (default: "0.0.0.0").
+    display_bind_host : str
+        UDP bind host for display feedback (default: "0.0.0.0").
 
     Raises
     ------
@@ -96,7 +102,12 @@ class PiNode(IPiNode):
 
     Example
     -------
-    >>> node = PiNode(pc_host="192.168.1.50", bind_host="192.168.1.100")
+    >>> node = PiNode(
+    ...     video_cfg=VideoConfig(width=640, height=480, fps=10, port=5000),
+    ...     feedback_cfg=FeedbackConfig(),
+    ...     video_bind_host="0.0.0.0",
+    ...     display_bind_host="0.0.0.0",
+    ... )
     >>> node.run()          # starts both threads, non-blocking
     >>> # … application logic or signal.pause() …
     >>> node.stop()         # graceful shutdown, joins both threads
@@ -116,27 +127,31 @@ class PiNode(IPiNode):
 
     def __init__(
         self,
-        pc_host: str,
-        camera_device: str = "/dev/video0",
-        bind_host: str = "0.0.0.0",
+        video_cfg: VideoConfig = VideoConfig(),
+        feedback_cfg: FeedbackConfig = FeedbackConfig(),
+        video_bind_host: str = "0.0.0.0",
+        display_bind_host: str = "0.0.0.0",
     ) -> None:
-        self._pc_host = pc_host
-        self._camera_device = camera_device
+        self._video_cfg = video_cfg
+        self._feedback_cfg = feedback_cfg
+        self._video_bind_host = video_bind_host
+        self._display_bind_host = display_bind_host
 
         self._video_sender = VideoSender(
-            pc_host=pc_host,
-            device=camera_device,
+            cfg=self._video_cfg,
+            bind_host=self._video_bind_host,
         )
         self._feedback_receiver = FeedbackReceiver(
-            bind_host=bind_host,
+            cfg=self._feedback_cfg,
+            bind_host=self._display_bind_host,
             display_callback=self._on_display_frame,
         )
 
         self._video_thread: threading.Thread | None = None
         self._feedback_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._oled_device = None
 
-    # ------------------------------------------------------------------
     def stream_video(self) -> None:
         """
         Thread-1 target: start the video uplink and block until stopped.
@@ -155,7 +170,11 @@ class PiNode(IPiNode):
         """
         try:
             self._video_sender.start()
-            logger.info("PiNode: video uplink active → %s", self._pc_host)
+            logger.info(
+                "PiNode: video uplink active on %s:%d",
+                self._video_bind_host,
+                self._video_cfg.port,
+            )
             self._stop_event.wait()  # Block until stop() is called.
         except Exception:
             logger.exception("PiNode: video uplink encountered a fatal error")
@@ -163,7 +182,6 @@ class PiNode(IPiNode):
             self._video_sender.stop()
             logger.info("PiNode: video uplink stopped")
 
-    # ------------------------------------------------------------------
     def process_feedback(self) -> None:
         """
         Thread-2 target: start the feedback downlink and block until stopped.
@@ -189,24 +207,45 @@ class PiNode(IPiNode):
             self._feedback_receiver.stop()
             logger.info("PiNode: feedback downlink stopped")
 
-    # ------------------------------------------------------------------
+    def _frame_bytes_to_points(self, frame_bytes: bytes) -> list[tuple[int, int]]:
+        """
+        Convert 1024 bytes of packed 1-bit monochrome pixel data to a list
+        of (x, y) coordinates where pixels are ON.
+
+        The input frame is 128×64 pixels, packed row-major with MSB-first
+        bit ordering within each byte. Bit value 1 = pixel ON.
+
+        Parameters
+        ----------
+        frame_bytes : bytes
+            Exactly 1024 bytes of packed 1-bit monochrome pixel data.
+
+        Returns
+        -------
+        list[tuple[int, int]]
+            List of (x, y) coordinates where pixels are ON.
+            0 ≤ x ≤ 127, 0 ≤ y ≤ 63.
+        """
+        points = []
+
+        for byte_index, byte_val in enumerate(frame_bytes):
+            # Calculate row (y) and column position within row (x_base)
+            # Each row has 128 pixels = 16 bytes
+            y = byte_index // 16
+            x_base = (byte_index % 16) * 8
+
+            # Check each bit in the byte (MSB-first)
+            for bit_pos in range(8):
+                if byte_val & (0x80 >> bit_pos):  # MSB-first: check bit 7, 6, 5, ...
+                    x = x_base + bit_pos
+                    points.append((x, y))
+
+        return points
+
     def _on_display_frame(self, frame_bytes: bytes) -> None:
         """
         Callback invoked by ``FeedbackReceiver`` for each incoming display
         framebuffer (``FeedbackConfig.DISPLAY_BYTES`` = 1024 bytes).
-
-        **Placeholder implementation** — logs receipt and stores the frame.
-        Replace (or subclass and override) to drive a real SSD1306 OLED,
-        for example::
-
-            from luma.core.interface.serial import i2c
-            from luma.oled.device import ssd1306
-            from PIL import Image
-
-            serial = i2c(port=1, address=0x3C)
-            device = ssd1306(serial)
-            img = Image.frombytes('1', (128, 64), frame_bytes)
-            device.display(img)
 
         Parameters
         ----------
@@ -214,10 +253,23 @@ class PiNode(IPiNode):
             Exactly ``FeedbackConfig.DISPLAY_BYTES`` (1024) bytes of
             packed 1-bit monochrome pixel data, row-major, MSB-first.
         """
-        logger.debug("PiNode: display frame received (%d bytes)", len(frame_bytes))
-        # TODO: replace with real SSD1306 driver call (see docstring above).
+        if len(frame_bytes) != FeedbackConfig.DISPLAY_BYTES:
+            logger.warning(
+                "PiNode: display frame size mismatch (%d bytes)", len(frame_bytes)
+            )
+            return
 
-    # ------------------------------------------------------------------
+        try:
+            if self._oled_device is None:
+                serial = i2c(port=1, address=0x3C)
+                self._oled_device = ssd1306(serial, rotate=2)
+
+            points = self._frame_bytes_to_points(frame_bytes)
+            with canvas(self._oled_device) as draw:
+                draw.point(points, fill="white")
+        except Exception:
+            logger.exception("PiNode: failed to render display frame")
+
     def run(self) -> None:
         """
         Launch the video-uplink and feedback-downlink threads.
@@ -250,7 +302,13 @@ class PiNode(IPiNode):
 
         self._video_thread.start()
         self._feedback_thread.start()
-        logger.info("PiNode running (PC host: %s)", self._pc_host)
+        logger.info(
+            "PiNode running (video %s:%d, display %s:%d)",
+            self._video_bind_host,
+            self._video_cfg.port,
+            self._display_bind_host,
+            self._feedback_cfg.DISPLAY_PORT,
+        )
 
     # ------------------------------------------------------------------
     def stop(self) -> None:
@@ -264,6 +322,8 @@ class PiNode(IPiNode):
         """
         logger.info("PiNode: stopping …")
         self._stop_event.set()
+        if self._oled_device is not None:
+            self._oled_device.clear
 
         for thread, name in [
             (self._video_thread, "video"),
@@ -276,21 +336,101 @@ class PiNode(IPiNode):
                         "PiNode: %s thread did not exit within timeout", name
                     )
 
+
         logger.info("PiNode stopped")
 
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run PiNode (video uplink + feedback downlink)"
+    )
+    parser.add_argument(
+        "--video-host",
+        default="0.0.0.0",
+        help="TCP bind host for VideoSender (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--video-port",
+        type=int,
+        default=5000,
+        help="TCP port for VideoSender (default: 5000)",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=640,
+        help="Video width in pixels (default: 640)",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=480,
+        help="Video height in pixels (default: 480)",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=10,
+        help="Video FPS (default: 10)",
+    )
+    parser.add_argument(
+        "--display-host",
+        default="0.0.0.0",
+        help="UDP bind host for display feedback (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--audio-port",
+        type=int,
+        default=5001,
+        help="UDP port for audio feedback (default: 5001)",
+    )
+    parser.add_argument(
+        "--display-port",
+        type=int,
+        default=5002,
+        help="UDP port for display feedback (default: 5002)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (default: INFO)",
+    )
 
-# ---------------------------------------------------------------------------
-# TODO — next steps
-# ---------------------------------------------------------------------------
-# 1. [PiNode._on_display_frame]  Wire in the luma.oled SSD1306 driver so
-#    that incoming framebuffers are rendered on the physical OLED panel.
-# 2. [PiNode]  Add a health-check / watchdog: if stream_video or
-#    process_feedback exits unexpectedly, restart the affected thread.
-# 3. [PiNode]  Expose a simple status API (e.g. is_streaming property)
-#    for monitoring from the main application.
-# 4. [VideoSender]  Test the v4l2src pipeline with the Pi Camera Module v3
-#    (libcamera stack); may require the ``libcamerasrc`` GStreamer element
-#    instead of ``v4l2src``.
-# 5. [General]  Create a systemd service file that launches PiNode on boot
-#    and restarts it on failure.
-# ---------------------------------------------------------------------------
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    video_cfg = VideoConfig(
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+        port=args.video_port,
+    )
+    feedback_cfg = FeedbackConfig()
+    feedback_cfg.AUDIO_PORT = args.audio_port
+    feedback_cfg.DISPLAY_PORT = args.display_port
+
+    node = PiNode(
+        video_cfg=video_cfg,
+        feedback_cfg=feedback_cfg,
+        video_bind_host=args.video_host,
+        display_bind_host=args.display_host,
+    )
+
+    node.run()
+
+    try:
+        signal.pause()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    finally:
+        node.stop()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
