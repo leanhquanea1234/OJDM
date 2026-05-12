@@ -22,12 +22,12 @@ assets/
     idle/*.opus
     detected/*.opus
   faces/
-    idle        (1024 bytes raw framebuffer)
-    love        (1024 bytes raw framebuffer)
+    idle        
+    love       
 
-Usage
+Example Usage
 -----
-python3 processor.py --pi-host 192.168.1.50 --model ./OJ_model_v1.pt --debug-gui
+python3 processor.py --pi-host <pi_address> --model <model_path> --debug-gui
 
 """
 
@@ -83,34 +83,6 @@ class Detection:
     class_name: str
     confidence: float
     bbox: tuple[int, int, int, int]
-
-
-@dataclass
-class ActionSet:
-    """
-    The set of feedback actions decided by a :class:`Decider`.
-
-    Attributes
-    ----------
-    play_audio : bool
-        Whether to play an audio alert on the Pi's speaker.
-    audio_label : str
-        Short label identifying *which* audio clip to play
-        (e.g. ``"alert"``).  The caller maps this to an actual Opus file.
-    update_display : bool
-        Whether to push a new image to the Pi's OLED display.
-    display_frame : bytes or None
-        1024-byte raw framebuffer to send, or ``None`` when
-        ``update_display`` is ``False``.
-    detections : list[Detection]
-        The detections that triggered this action set (for logging/debug).
-    """
-
-    play_audio: bool = False
-    audio_label: str = ""
-    update_display: bool = False
-    display_frame: Optional[bytes] = None
-    detections: list[Detection] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +283,7 @@ def _load_audio_pools(base: Path) -> AudioPools:
     logger.info("Loaded %d idle audio clips, %d detected clips", len(idle), len(detected))
     return AudioPools(idle=idle, detected=detected)
 
+# prob theres a better way to do this
 def _bitstring_to_display_bytes(bit_string: str) -> bytes:
     cleaned = "".join(ch for ch in bit_string.strip() if ch in ("0", "1"))
     expected_bits = DISPLAY_BYTES * 8  # 8192
