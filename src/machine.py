@@ -203,10 +203,12 @@ class PiNode(IPiNode):
                 logger.exception("PiNode: failed to clear waiting screen")
 
     def _on_first_audio_packet_probe(self, _pad, _info):
+        """GStreamer pad-probe callback: fires on the first incoming audio RTP buffer."""
         self._hide_waiting_for_processor("first incoming audio packet")
         return Gst.PadProbeReturn.REMOVE
 
     def _on_video_uplink_client_connected(self, *_args) -> None:
+        """tcpserversink signal callback invoked when the first video TCP client connects."""
         self._hide_waiting_for_processor("first successful TCP connection on video uplink")
 
     def _attach_video_uplink_activity_probe(self) -> None:
