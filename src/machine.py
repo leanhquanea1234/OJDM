@@ -35,6 +35,7 @@ from __future__ import annotations
 import sys
 import argparse
 import signal
+import socket
 from luma.core.interface.serial import i2c
 from luma.core.render import canvas
 from luma.oled.device import ssd1306, ssd1325, ssd1331, sh1106
@@ -43,6 +44,10 @@ from time import sleep
 import logging
 import threading
 from abc import ABC, abstractmethod
+
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
 
 from data_transfer import VideoConfig, FeedbackConfig, VideoSender, FeedbackReceiver
 
@@ -151,6 +156,134 @@ class PiNode(IPiNode):
         self._feedback_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._oled_device = None
+        self._waiting_overlay_lock = threading.Lock()
+        self._waiting_overlay_visible = False
+        self._video_probe_attached = False
+        self._audio_probe_attached = False
+
+    def _get_local_ip(self) -> str:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("8.8.8.8", 80))
+                return sock.getsockname()[0]
+        except Exception as exc:
+            logger.warning("PiNode: failed to determine local IP: %s", exc)
+            return "unknown"
+
+    @staticmethod
+    def _iter_pipeline_elements(pipeline):
+        iterator = pipeline.iterate_elements()
+        while True:
+            result, element = iterator.next()
+            if result == Gst.IteratorResult.OK:
+                yield element
+                continue
+            if result == Gst.IteratorResult.DONE:
+                return
+            return
+
+    def _show_waiting_for_processor(self) -> None:
+        with self._waiting_overlay_lock:
+            if self._waiting_overlay_visible:
+                return
+            self._waiting_overlay_visible = True
+
+        ip = self._get_local_ip()
+        logger.info("PiNode: waiting for processor to connect (local IP: %s)", ip)
+
+        try:
+            if self._oled_device is None:
+                serial = i2c(port=1, address=0x3C)
+                self._oled_device = ssd1306(serial, rotate=2)
+            with canvas(self._oled_device) as draw:
+                draw.text((0, 0), "Waiting for", fill="white")
+                draw.text((0, 16), "processor...", fill="white")
+                draw.text((0, 40), f"IP: {ip}", fill="white")
+        except Exception:
+            logger.exception("PiNode: failed to render waiting screen")
+
+    def _hide_waiting_for_processor(self, reason: str) -> None:
+        with self._waiting_overlay_lock:
+            if not self._waiting_overlay_visible:
+                return
+            self._waiting_overlay_visible = False
+
+        logger.info("PiNode: processor activity detected (%s), clearing wait screen", reason)
+        if self._oled_device is not None:
+            try:
+                self._oled_device.clear()
+            except Exception:
+                logger.exception("PiNode: failed to clear waiting screen")
+
+    def _on_first_audio_packet_probe(self, pad, info):
+        """
+        GStreamer pad-probe callback for the feedback audio ``udpsrc``.
+
+        Parameters
+        ----------
+        pad : Gst.Pad
+            Source pad where the incoming audio RTP buffer was observed.
+        info : Gst.PadProbeInfo
+            Probe metadata for the current buffer.
+
+        Returns
+        -------
+        Gst.PadProbeReturn
+            ``REMOVE`` to detach this probe after the first packet.
+        """
+        _ = (pad, info)
+        self._hide_waiting_for_processor("first incoming audio packet")
+        return Gst.PadProbeReturn.REMOVE
+
+    def _on_video_uplink_client_connected(self, *_args) -> None:
+        """
+        ``tcpserversink`` signal callback for client connection events.
+
+        Parameters
+        ----------
+        *_args : tuple
+            Signal arguments supplied by GStreamer for ``client-added``.
+            They are unused; the callback only marks first connection activity.
+        """
+        self._hide_waiting_for_processor("first successful TCP connection on video uplink")
+
+    def _attach_video_uplink_activity_probe(self) -> None:
+        if self._video_probe_attached:
+            return
+
+        pipeline = getattr(self._video_sender, "_pipeline", None)
+        if pipeline is None:
+            return
+
+        for element in self._iter_pipeline_elements(pipeline):
+            factory = element.get_factory()
+            if factory and factory.get_name() == "tcpserversink":
+                try:
+                    element.connect("client-added", self._on_video_uplink_client_connected)
+                    self._video_probe_attached = True
+                except TypeError:
+                    logger.debug("PiNode: tcpserversink has no client-added signal")
+                break
+
+    def _attach_feedback_audio_activity_probe(self) -> None:
+        if self._audio_probe_attached:
+            return
+
+        pipeline = getattr(self._feedback_receiver, "_pipeline", None)
+        if pipeline is None:
+            return
+
+        for element in self._iter_pipeline_elements(pipeline):
+            factory = element.get_factory()
+            if factory and factory.get_name() == "udpsrc":
+                src_pad = element.get_static_pad("src")
+                if src_pad is not None:
+                    src_pad.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        self._on_first_audio_packet_probe,
+                    )
+                    self._audio_probe_attached = True
+                break
 
     def stream_video(self) -> None:
         """
@@ -170,6 +303,7 @@ class PiNode(IPiNode):
         """
         try:
             self._video_sender.start()
+            self._attach_video_uplink_activity_probe()
             logger.info(
                 "PiNode: video uplink active on %s:%d",
                 self._video_bind_host,
@@ -199,6 +333,7 @@ class PiNode(IPiNode):
         """
         try:
             self._feedback_receiver.start()
+            self._attach_feedback_audio_activity_probe()
             logger.info("PiNode: feedback downlink active")
             self._stop_event.wait()
         except Exception:
@@ -253,6 +388,8 @@ class PiNode(IPiNode):
             Exactly ``FeedbackConfig.DISPLAY_BYTES`` (1024) bytes of
             packed 1-bit monochrome pixel data, row-major, MSB-first.
         """
+        self._hide_waiting_for_processor("first incoming display frame")
+
         if len(frame_bytes) != FeedbackConfig.DISPLAY_BYTES:
             logger.warning(
                 "PiNode: display frame size mismatch (%d bytes)", len(frame_bytes)
@@ -288,6 +425,9 @@ class PiNode(IPiNode):
             raise RuntimeError("PiNode is already running; call stop() first")
 
         self._stop_event.clear()
+        self._video_probe_attached = False
+        self._audio_probe_attached = False
+        self._show_waiting_for_processor()
 
         self._video_thread = threading.Thread(
             target=self.stream_video,
@@ -322,8 +462,7 @@ class PiNode(IPiNode):
         """
         logger.info("PiNode: stopping …")
         self._stop_event.set()
-        if self._oled_device is not None:
-            self._oled_device.clear
+        self._hide_waiting_for_processor("shutdown")
 
         for thread, name in [
             (self._video_thread, "video"),
@@ -433,4 +572,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
