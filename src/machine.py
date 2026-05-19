@@ -167,8 +167,20 @@ class PiNode(IPiNode):
                 sock.connect(("8.8.8.8", 80))
                 return sock.getsockname()[0]
         except Exception as exc:
-            logger.debug("PiNode: failed to determine local IP: %s", exc)
+            logger.warning("PiNode: failed to determine local IP: %s", exc)
             return "unknown"
+
+    @staticmethod
+    def _iter_pipeline_elements(pipeline):
+        iterator = pipeline.iterate_elements()
+        while True:
+            result, element = iterator.next()
+            if result == Gst.IteratorResult.OK:
+                yield element
+                continue
+            if result == Gst.IteratorResult.DONE:
+                return
+            return
 
     def _show_waiting_for_processor(self) -> None:
         with self._waiting_overlay_lock:
@@ -203,15 +215,15 @@ class PiNode(IPiNode):
             except Exception:
                 logger.exception("PiNode: failed to clear waiting screen")
 
-    def _on_first_audio_packet_probe(self, _pad, _info):
+    def _on_first_audio_packet_probe(self, pad, info):
         """
         GStreamer pad-probe callback for the feedback audio ``udpsrc``.
 
         Parameters
         ----------
-        _pad : Gst.Pad
+        pad : Gst.Pad
             Source pad where the incoming audio RTP buffer was observed.
-        _info : Gst.PadProbeInfo
+        info : Gst.PadProbeInfo
             Probe metadata for the current buffer.
 
         Returns
@@ -219,6 +231,7 @@ class PiNode(IPiNode):
         Gst.PadProbeReturn
             ``REMOVE`` to detach this probe after the first packet.
         """
+        _ = (pad, info)
         self._hide_waiting_for_processor("first incoming audio packet")
         return Gst.PadProbeReturn.REMOVE
 
@@ -242,21 +255,14 @@ class PiNode(IPiNode):
         if pipeline is None:
             return
 
-        iterator = pipeline.iterate_elements()
-        while True:
-            result, element = iterator.next()
-            if result == Gst.IteratorResult.OK:
-                factory = element.get_factory()
-                if factory and factory.get_name() == "tcpserversink":
-                    try:
-                        element.connect("client-added", self._on_video_uplink_client_connected)
-                        self._video_probe_attached = True
-                    except TypeError:
-                        logger.debug("PiNode: tcpserversink has no client-added signal")
-                    break
-            elif result == Gst.IteratorResult.DONE:
-                break
-            else:
+        for element in self._iter_pipeline_elements(pipeline):
+            factory = element.get_factory()
+            if factory and factory.get_name() == "tcpserversink":
+                try:
+                    element.connect("client-added", self._on_video_uplink_client_connected)
+                    self._video_probe_attached = True
+                except TypeError:
+                    logger.debug("PiNode: tcpserversink has no client-added signal")
                 break
 
     def _attach_feedback_audio_activity_probe(self) -> None:
@@ -267,23 +273,16 @@ class PiNode(IPiNode):
         if pipeline is None:
             return
 
-        iterator = pipeline.iterate_elements()
-        while True:
-            result, element = iterator.next()
-            if result == Gst.IteratorResult.OK:
-                factory = element.get_factory()
-                if factory and factory.get_name() == "udpsrc":
-                    src_pad = element.get_static_pad("src")
-                    if src_pad is not None:
-                        src_pad.add_probe(
-                            Gst.PadProbeType.BUFFER,
-                            self._on_first_audio_packet_probe,
-                        )
-                        self._audio_probe_attached = True
-                    break
-            elif result == Gst.IteratorResult.DONE:
-                break
-            else:
+        for element in self._iter_pipeline_elements(pipeline):
+            factory = element.get_factory()
+            if factory and factory.get_name() == "udpsrc":
+                src_pad = element.get_static_pad("src")
+                if src_pad is not None:
+                    src_pad.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        self._on_first_audio_packet_probe,
+                    )
+                    self._audio_probe_attached = True
                 break
 
     def stream_video(self) -> None:
