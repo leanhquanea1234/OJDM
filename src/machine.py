@@ -166,7 +166,8 @@ class PiNode(IPiNode):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.connect(("8.8.8.8", 80))
                 return sock.getsockname()[0]
-        except Exception:
+        except Exception as exc:
+            logger.debug("PiNode: failed to determine local IP: %s", exc)
             return "unknown"
 
     def _show_waiting_for_processor(self) -> None:
@@ -203,12 +204,34 @@ class PiNode(IPiNode):
                 logger.exception("PiNode: failed to clear waiting screen")
 
     def _on_first_audio_packet_probe(self, _pad, _info):
-        """GStreamer pad-probe callback: fires on the first incoming audio RTP buffer."""
+        """
+        GStreamer pad-probe callback for the feedback audio ``udpsrc``.
+
+        Parameters
+        ----------
+        _pad : Gst.Pad
+            Source pad where the incoming audio RTP buffer was observed.
+        _info : Gst.PadProbeInfo
+            Probe metadata for the current buffer.
+
+        Returns
+        -------
+        Gst.PadProbeReturn
+            ``REMOVE`` to detach this probe after the first packet.
+        """
         self._hide_waiting_for_processor("first incoming audio packet")
         return Gst.PadProbeReturn.REMOVE
 
     def _on_video_uplink_client_connected(self, *_args) -> None:
-        """tcpserversink signal callback invoked when the first video TCP client connects."""
+        """
+        ``tcpserversink`` signal callback for client connection events.
+
+        Parameters
+        ----------
+        *_args : tuple
+            Signal arguments supplied by GStreamer for ``client-added``.
+            They are unused; the callback only marks first connection activity.
+        """
         self._hide_waiting_for_processor("first successful TCP connection on video uplink")
 
     def _attach_video_uplink_activity_probe(self) -> None:
