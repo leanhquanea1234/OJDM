@@ -357,10 +357,12 @@ class DebugGUI:
     def _poll_and_display(self) -> None:
         frame = self._frame_buffer.get()
         if frame is not None:
+            frame = np.rot90(frame, 2)
             detections = self._detector.detect(frame)
 
             rgb = frame[..., ::-1]
             img = self._Image.fromarray(rgb)
+            
             draw = self._ImageDraw.Draw(img)
 
             try:
@@ -470,6 +472,8 @@ class Processor:
                 if frame is None:
                     time.sleep(0.01)
                     continue
+
+                frame = np.rot90(frame, 2) 
 
                 detections = self._detector.detect(frame)
                 detected = len(detections) > 0

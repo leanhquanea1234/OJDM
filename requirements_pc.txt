@@ -2,5 +2,6 @@ ultralytics
 numpy
 opencv-python
 PyGObject
+tinker
 
 Pillow
