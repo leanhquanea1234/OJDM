@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 import socket
 import threading
 from pathlib import Path
@@ -26,6 +27,8 @@ from tempfile import NamedTemporaryFile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional
+from enum import Enum
+
 
 import numpy as np
 
@@ -109,6 +112,18 @@ class FeedbackConfig:
     AUDIO_FORMAT: str = "opus"
     AUDIO_PORT: int = 5001
     DISPLAY_PORT: int = 5002
+    CONTROL_PORT: int = 5003
+
+class RoombaMovement(str, Enum):
+    FORWARD = "FORWARD"
+    BACKWARD = "BACKWARD"
+    STOP = "STOP"
+
+@dataclass
+class ControlFeedback:
+    pan_output: float
+    tilt_output: float
+    roomba_movement: RoombaMovement
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +514,21 @@ class FeedbackSender(_GstRunner, FeedbackTransferer):
             raise RuntimeError("FeedbackSender display socket is not initialized")
         self._display_sock.sendto(payload, (self._display_host, self._cfg.DISPLAY_PORT))
         logger.debug("FeedbackSender: sent display frame (%d bytes)", len(payload))
+    def send_control(self, pan_output: float, tilt_output: float, roomba_movement: str) -> None:
+        if roomba_movement not in {"FORWARD", "BACKWARD", "STOP"}:
+            raise ValueError("Invalid roomba_movement")
+
+        payload = json.dumps({
+            "pan_output": float(pan_output),
+            "tilt_output": float(tilt_output),
+            "roomba_movement": roomba_movement,
+        }).encode("utf-8")
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(payload, (self._display_host, self._cfg.CONTROL_PORT))
+        finally:
+            sock.close()
 
 
 class FeedbackReceiver(_GstRunner, FeedbackTransferer):
@@ -515,6 +545,7 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
         cfg: FeedbackConfig = FeedbackConfig(),
         bind_host: str = "0.0.0.0",
         display_callback: Optional[Callable[[bytes], None]] = None,
+        control_callback: Optional[Callable[[float, float, RoombaMovement], None]] = None,
         audio_sink: str = "autoaudiosink",
     ) -> None:
         super().__init__()
@@ -526,6 +557,11 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
         self._display_sock: Optional[socket.socket] = None
         self._display_thread: Optional[threading.Thread] = None
         self._display_stop = threading.Event()
+        
+        self._control_sock: Optional[socket.socket] = None
+        self._control_thread: Optional[threading.Thread] = None
+        self._control_stop = threading.Event()
+        self._control_callback = control_callback
 
     def _build_audio_pipeline_str(self) -> str:
         return (
@@ -574,6 +610,31 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
                 except Exception:
                     logger.exception("FeedbackReceiver: display_callback raised an exception")
 
+    def _control_recv_loop(self) -> None:
+        assert self._control_sock is not None
+        while not self._control_stop.is_set():
+            try:
+                data, _ = self._control_sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            try:
+                obj = json.loads(data.decode("utf-8"))
+                pan = float(obj["pan_output"])
+                tilt = float(obj["tilt_output"])
+                move = obj["roomba_movement"]
+                if move not in {"FORWARD", "BACKWARD", "STOP"}:
+                    raise ValueError("invalid movement")
+            except Exception:
+                logger.warning("Dropped malformed control packet")
+                continue
+
+            if self._control_callback is not None:
+                move = RoombaMovement(obj["roomba_movement"])
+                self._control_callback(pan, tilt, move)
+
     def start(self) -> None:
         if self._display_sock is not None:
             return
@@ -593,6 +654,19 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
         )
         self._display_thread.start()
 
+        self._control_stop.clear()
+        self._control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._control_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._control_sock.bind((self._bind_host, self._cfg.CONTROL_PORT))
+        self._control_sock.settimeout(self._DISPLAY_SOCKET_TIMEOUT_SECONDS)
+
+        self._control_thread = threading.Thread(
+            target=self._control_recv_loop,
+            name="FeedbackReceiver-control",
+            daemon=True,
+        )
+        self._control_thread.start()
+
         logger.info(
             "FeedbackReceiver started (audio UDP/RTP :%d, display UDP %s:%d)",
             self._cfg.AUDIO_PORT,
@@ -602,16 +676,27 @@ class FeedbackReceiver(_GstRunner, FeedbackTransferer):
 
     def stop(self) -> None:
         self._display_stop.set()
+        self._control_stop.set()
 
         if self._display_sock is not None:
             self._display_sock.close()
             self._display_sock = None
+
+        if self._control_sock is not None:
+            self._control_sock.close()
+            self._control_sock = None
 
         if self._display_thread is not None:
             self._display_thread.join(timeout=self._THREAD_JOIN_TIMEOUT_SECONDS)
             if self._display_thread.is_alive():
                 logger.warning("FeedbackReceiver: display thread did not exit within timeout")
             self._display_thread = None
+
+        if self._control_thread is not None:
+            self._control_thread.join(timeout=self._THREAD_JOIN_TIMEOUT_SECONDS)
+            if self._control_thread.is_alive():
+                logger.warning("FeedbackReceiver: control thread did not exit within timeout")
+            self._control_thread = None
 
         self._stop_pipeline()
         logger.info("FeedbackReceiver stopped")
