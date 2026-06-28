@@ -36,10 +36,10 @@ import sys
 import argparse
 import signal
 import socket
+from enum import Enum
 from luma.core.interface.serial import i2c
 from luma.core.render import canvas
-from luma.oled.device import ssd1306, ssd1325, ssd1331, sh1106
-from time import sleep
+from luma.oled.device import ssd1306
 
 import logging
 import threading
@@ -49,9 +49,29 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-from data_transfer import VideoConfig, FeedbackConfig, VideoSender, FeedbackReceiver
+from data_transfer import VideoConfig, FeedbackConfig, VideoSender, FeedbackReceiver, RoombaMovement
 
 logger = logging.getLogger(__name__)
+
+try:
+    import RPi.GPIO as GPIO  # type: ignore[import-not-found]
+except Exception:
+    GPIO = None
+
+try:
+    import gpiozero
+    from gpiozero import Servo
+    from gpiozero.pins.pigpio import PiGPIOFactory
+except Exception:
+    gpiozero = None
+    Servo = None
+    PiGPIOFactory = None
+
+
+class _MovementPins(Enum):
+    ENABLE = 22
+    FORWARD = 27
+    BACKWARD = 17
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +170,7 @@ class PiNode(IPiNode):
             cfg=self._feedback_cfg,
             bind_host=self._display_bind_host,
             display_callback=self._on_display_frame,
+            control_callback=self._on_control_feedback,
         )
 
         self._video_thread: threading.Thread | None = None
@@ -160,6 +181,86 @@ class PiNode(IPiNode):
         self._waiting_overlay_visible = False
         self._video_probe_attached = False
         self._audio_probe_attached = False
+        self._gpio_ready = False
+        self._movement_lock = threading.Lock()
+        self._pan_servo = None
+        self._tilt_servo = None
+        self._servo_lock = threading.Lock()
+        self._setup_movement_gpio()
+        self._setup_servos()
+
+    def _setup_movement_gpio(self) -> None:
+        if GPIO is None:
+            logger.warning("PiNode: RPi.GPIO unavailable; movement control disabled")
+            return
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(_MovementPins.ENABLE.value, GPIO.OUT)
+            GPIO.setup(_MovementPins.FORWARD.value, GPIO.OUT)
+            GPIO.setup(_MovementPins.BACKWARD.value, GPIO.OUT)
+            GPIO.output(_MovementPins.ENABLE.value, GPIO.LOW)
+            GPIO.output(_MovementPins.FORWARD.value, GPIO.LOW)
+            GPIO.output(_MovementPins.BACKWARD.value, GPIO.LOW)
+            self._gpio_ready = True
+        except Exception:
+            logger.exception("PiNode: failed to initialize movement GPIO")
+
+    def _setup_servos(self) -> None:
+        if gpiozero is None or Servo is None or PiGPIOFactory is None:
+            logger.warning("PiNode: gpiozero/pigpio unavailable; servo control disabled")
+            return
+        try:
+            gpiozero.Device.pin_factory = PiGPIOFactory("127.0.0.1")
+            correction = 0.45
+            max_pw = (2.0 + correction) / 1000.0
+            min_pw = (1.0 - correction) / 1000.0
+            self._pan_servo = Servo(13, min_pulse_width=min_pw, max_pulse_width=max_pw)
+            self._tilt_servo = Servo(12, min_pulse_width=min_pw, max_pulse_width=max_pw)
+            self._pan_servo.mid()
+            self._tilt_servo.mid()
+        except Exception:
+            logger.exception("PiNode: failed to initialize servos")
+            self._pan_servo = None
+            self._tilt_servo = None
+
+    def _on_control_feedback(self, pan_output: float, tilt_output: float, move: RoombaMovement) -> None:
+        self._hide_waiting_for_processor("first incoming control frame")
+        self._apply_movement(move)
+        self._apply_servo_outputs(pan_output, tilt_output)
+
+    def _apply_movement(self, move: RoombaMovement) -> None:
+        if not self._gpio_ready or GPIO is None:
+            return
+        with self._movement_lock:
+            try:
+                if move == RoombaMovement.FORWARD:
+                    GPIO.output(_MovementPins.ENABLE.value, GPIO.HIGH)
+                    GPIO.output(_MovementPins.BACKWARD.value, GPIO.LOW)
+                    GPIO.output(_MovementPins.FORWARD.value, GPIO.HIGH)
+                elif move == RoombaMovement.BACKWARD:
+                    GPIO.output(_MovementPins.ENABLE.value, GPIO.HIGH)
+                    GPIO.output(_MovementPins.FORWARD.value, GPIO.LOW)
+                    GPIO.output(_MovementPins.BACKWARD.value, GPIO.HIGH)
+                else:
+                    GPIO.output(_MovementPins.ENABLE.value, GPIO.LOW)
+                    GPIO.output(_MovementPins.FORWARD.value, GPIO.LOW)
+                    GPIO.output(_MovementPins.BACKWARD.value, GPIO.LOW)
+            except Exception:
+                logger.exception("PiNode: failed to apply movement command %s", move.value)
+
+    def _apply_servo_outputs(self, pan_output: float, tilt_output: float) -> None:
+        if self._pan_servo is None or self._tilt_servo is None:
+            return
+        with self._servo_lock:
+            try:
+                self._pan_servo.value = max(-1.0, min(1.0, float(pan_output)))
+                self._tilt_servo.value = max(-1.0, min(1.0, float(tilt_output)))
+            except Exception:
+                logger.exception(
+                    "PiNode: failed to apply servo outputs pan=%.3f tilt=%.3f",
+                    pan_output,
+                    tilt_output,
+                )
 
     def _get_local_ip(self) -> str:
         try:
@@ -475,6 +576,15 @@ class PiNode(IPiNode):
                         "PiNode: %s thread did not exit within timeout", name
                     )
 
+
+        if self._gpio_ready and GPIO is not None:
+            try:
+                GPIO.output(_MovementPins.ENABLE.value, GPIO.LOW)
+                GPIO.output(_MovementPins.FORWARD.value, GPIO.LOW)
+                GPIO.output(_MovementPins.BACKWARD.value, GPIO.LOW)
+                GPIO.cleanup()
+            except Exception:
+                logger.exception("PiNode: failed to clean up GPIO")
 
         logger.info("PiNode stopped")
 

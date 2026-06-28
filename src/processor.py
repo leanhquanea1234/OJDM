@@ -412,6 +412,12 @@ class Processor:
         audio_pools: AudioPools,
         face_frames: FaceFrames,
         idle_interval_seconds: float,
+        no_detection_buffer_seconds: float,
+        detected_stop_seconds: float,
+        idle_forward_weight: float,
+        idle_backward_weight: float,
+        idle_stop_weight: float,
+        control_interval_seconds: float,
         debug_gui: bool,
     ) -> None:
         self._pi_host = pi_host
@@ -420,6 +426,17 @@ class Processor:
 
         self._audio_pools = audio_pools
         self._faces = face_frames
+
+        self._no_detection_buffer = max(0.0, no_detection_buffer_seconds)
+        self._detected_stop_seconds = max(0.0, detected_stop_seconds)
+        self._control_interval_seconds = max(0.01, control_interval_seconds)
+        self._idle_movement_weights = (
+            max(0.0, idle_forward_weight),
+            max(0.0, idle_backward_weight),
+            max(0.0, idle_stop_weight),
+        )
+        if sum(self._idle_movement_weights) == 0:
+            self._idle_movement_weights = (0.8, 0.15, 0.05)
 
         self._frame_buffer = FrameBuffer()
         self._detector = Detector(
@@ -437,6 +454,16 @@ class Processor:
 
         self._last_idle_audio_time = 0.0
         self._last_state_detected = False
+        self._last_detection_time = 0.0
+        self._detected_stop_until = 0.0
+        self._last_control_time = 0.0
+        self._current_pan_output = 0.0
+        self._current_tilt_output = 0.0
+        self._idle_pan_positions = [-1.0, -0.5, 0.0, 0.5, 1.0]
+        self._idle_tilt_positions = [0.3, 0.6, 0.8, 1.0]
+        self._idle_pan_index = 0
+        self._idle_pan_direction = 1
+        self._idle_tilt_index = 0
         self._debug_gui_enabled = debug_gui
         self._debug_gui: Optional[DebugGUI] = None
         self._stop_event = threading.Event()
@@ -465,6 +492,79 @@ class Processor:
         if self._last_state_detected:
             self._feedback.send_display(self._faces.idle)
 
+    def _next_idle_movement(self) -> str:
+        return random.choices(
+            ["FORWARD", "BACKWARD", "STOP"],
+            weights=self._idle_movement_weights,
+            k=1,
+        )[0]
+
+    def _compute_idle_sweep_control(self) -> tuple[float, float]:
+        pan = self._idle_pan_positions[self._idle_pan_index]
+        tilt = self._idle_tilt_positions[self._idle_tilt_index]
+
+        self._idle_pan_index += self._idle_pan_direction
+        if self._idle_pan_index >= len(self._idle_pan_positions):
+            self._idle_pan_index = len(self._idle_pan_positions) - 2
+            self._idle_pan_direction = -1
+            self._idle_tilt_index = (self._idle_tilt_index + 1) % len(self._idle_tilt_positions)
+        elif self._idle_pan_index < 0:
+            self._idle_pan_index = 1
+            self._idle_pan_direction = 1
+            self._idle_tilt_index = (self._idle_tilt_index + 1) % len(self._idle_tilt_positions)
+
+        self._current_pan_output = pan
+        self._current_tilt_output = tilt
+        return self._current_pan_output, self._current_tilt_output
+
+    @staticmethod
+    def _largest_detection(detections: list[Detection]) -> Optional[Detection]:
+        if not detections:
+            return None
+        return max(
+            detections,
+            key=lambda d: max(0, d.bbox[2] - d.bbox[0]) * max(0, d.bbox[3] - d.bbox[1]),
+        )
+
+    def _update_tracking_control(self, frame: np.ndarray, detections: list[Detection]) -> tuple[float, float]:
+        target = self._largest_detection(detections)
+        if target is None:
+            return self._current_pan_output, self._current_tilt_output
+
+        x1, y1, x2, y2 = target.bbox
+        h, w, _ = frame.shape
+        if w <= 0 or h <= 0:
+            return self._current_pan_output, self._current_tilt_output
+
+        obj_cx = (x1 + x2) / 2.0
+        obj_cy = (y1 + y2) / 2.0
+        error_x = (w / 2.0 - obj_cx) / (w / 2.0)
+        error_y = (h / 2.0 - obj_cy) / (h / 2.0)
+
+        self._current_pan_output = max(-1.0, min(1.0, self._current_pan_output + 0.2 * error_x))
+        self._current_tilt_output = max(-1.0, min(1.0, self._current_tilt_output + 0.2 * error_y))
+        return self._current_pan_output, self._current_tilt_output
+
+    def _send_control_feedback(
+        self,
+        now: float,
+        detected_active: bool,
+        frame: np.ndarray,
+        detections: list[Detection],
+    ) -> None:
+        if now - self._last_control_time < self._control_interval_seconds:
+            return
+
+        if detected_active:
+            pan_output, tilt_output = self._update_tracking_control(frame, detections)
+            movement = "STOP" if now < self._detected_stop_until else self._next_idle_movement()
+        else:
+            pan_output, tilt_output = self._compute_idle_sweep_control()
+            movement = self._next_idle_movement()
+
+        self._feedback.send_control(pan_output, tilt_output, movement)
+        self._last_control_time = now
+
     def run_loop(self) -> None:
         try:
             while not self._stop_event.is_set():
@@ -480,12 +580,27 @@ class Processor:
 
                 now = time.monotonic()
                 if detected:
+                    self._last_detection_time = now
+                    self._detected_stop_until = max(
+                        self._detected_stop_until,
+                        now + self._detected_stop_seconds,
+                    )
+
+                detected_active = (now - self._last_detection_time) <= self._no_detection_buffer
+                if detected_active:
                     if not self._last_state_detected:
                         self._send_detected_feedback()
                     self._last_state_detected = True
                 else:
                     self._send_idle_feedback(now)
                     self._last_state_detected = False
+
+                self._send_control_feedback(
+                    now=now,
+                    detected_active=detected_active,
+                    frame=frame,
+                    detections=detections,
+                )
 
                 time.sleep(0.01)
         except KeyboardInterrupt:
@@ -506,6 +621,12 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=480, help="Video height")
     parser.add_argument("--fps", type=int, default=10, help="Video FPS")
     parser.add_argument("--idle-interval", type=float, default=40.0, help="Idle audio interval (s)")
+    parser.add_argument("--no-detection-buffer", type=float, default=4.0, help="Detection hold buffer in seconds")
+    parser.add_argument("--detected-stop-seconds", type=float, default=13.0, help="How long to keep STOP movement in detected state")
+    parser.add_argument("--idle-forward-weight", type=float, default=0.8, help="Idle forward movement weight")
+    parser.add_argument("--idle-backward-weight", type=float, default=0.15, help="Idle backward movement weight")
+    parser.add_argument("--idle-stop-weight", type=float, default=0.05, help="Idle stop movement weight")
+    parser.add_argument("--control-interval", type=float, default=0.2, help="Control packet send interval in seconds")
     parser.add_argument("--assets", default="assets", help="Assets base directory")
     parser.add_argument("--debug-gui", action="store_true", help="Show debug GUI with boxes")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
@@ -537,6 +658,12 @@ def main() -> int:
         audio_pools=audio_pools,
         face_frames=face_frames,
         idle_interval_seconds=args.idle_interval,
+        no_detection_buffer_seconds=args.no_detection_buffer,
+        detected_stop_seconds=args.detected_stop_seconds,
+        idle_forward_weight=args.idle_forward_weight,
+        idle_backward_weight=args.idle_backward_weight,
+        idle_stop_weight=args.idle_stop_weight,
+        control_interval_seconds=args.control_interval,
         debug_gui=args.debug_gui,
     )
 
