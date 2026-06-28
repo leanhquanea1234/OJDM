@@ -194,7 +194,7 @@ class PiNode(IPiNode):
         try:
             if self._oled_device is None:
                 serial = i2c(port=1, address=0x3C)
-                self._oled_device = ssd1306(serial, rotate=2)
+                self._oled_device = ssd1306(serial)
             with canvas(self._oled_device) as draw:
                 draw.text((0, 0), "Waiting for", fill="white")
                 draw.text((0, 16), "processor...", fill="white")
@@ -399,7 +399,7 @@ class PiNode(IPiNode):
         try:
             if self._oled_device is None:
                 serial = i2c(port=1, address=0x3C)
-                self._oled_device = ssd1306(serial, rotate=0)
+                self._oled_device = ssd1306(serial)
 
             points = self._frame_bytes_to_points(frame_bytes)
             with canvas(self._oled_device) as draw:
