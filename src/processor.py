@@ -271,6 +271,7 @@ class AudioPools:
 class FaceFrames:
     idle: bytes
     love: bytes
+    sleep: bytes
 
 
 def _load_audio_pools(base: Path) -> AudioPools:
@@ -302,20 +303,25 @@ def _bitstring_to_display_bytes(bit_string: str) -> bytes:
 def _load_face_frames(faces_dir: Path) -> FaceFrames:
     idle_path = faces_dir / "idle"
     love_path = faces_dir / "love"
+    # hehe im lazy:3
+    sleep_path = faces_dir / "happy"
     
 
     idle_raw = idle_path.read_bytes()
     love_raw = love_path.read_bytes()
+    sleep_raw = sleep_path.read_bytes()
 
-    if len(idle_raw) == DISPLAY_BYTES and len(love_raw) == DISPLAY_BYTES:
-        return FaceFrames(idle=idle_raw, love=love_raw)
+    if len(idle_raw) == DISPLAY_BYTES and len(love_raw) == DISPLAY_BYTES and len(sleep_raw) == DISPLAY_BYTES:
+        return FaceFrames(idle=idle_raw, love=love_raw, sleep=sleep_raw)
 
     # Treat as ASCII bitstrings
     idle_text = idle_raw.decode("utf-8")
     love_text = love_raw.decode("utf-8")
+    sleep_text = sleep_raw.decode("utf-8")
     idle = _bitstring_to_display_bytes(idle_text)
     love = _bitstring_to_display_bytes(love_text)
-    return FaceFrames(idle=idle, love=love)
+    sleep = _bitstring_to_display_bytes(sleep_text)
+    return FaceFrames(idle=idle, love=love,sleep=sleep)
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +515,7 @@ class Processor:
     def start(self) -> None:
         self._receiver.start()
         self._feedback.start()
+        self._feedback.send_display(self._faces.sleep)
 
     def stop(self) -> None:
         self._receiver.stop()
