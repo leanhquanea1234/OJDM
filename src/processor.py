@@ -302,6 +302,7 @@ def _bitstring_to_display_bytes(bit_string: str) -> bytes:
 def _load_face_frames(faces_dir: Path) -> FaceFrames:
     idle_path = faces_dir / "idle"
     love_path = faces_dir / "love"
+    
 
     idle_raw = idle_path.read_bytes()
     love_raw = love_path.read_bytes()
@@ -369,6 +370,43 @@ class DebugGUI:
                 font = self._ImageFont.truetype("arial.ttf", 14)
             except Exception:
                 font = self._ImageFont.load_default()
+            if detections:
+                w, h = img.size
+                cx, cy = w // 2, h // 2
+                cross_len = 30
+                cross_color = "red"
+                cross_width = 3
+
+                # horizontal line
+                draw.line(
+                    [(cx - cross_len, cy), (cx + cross_len, cy)],
+                    fill=cross_color,
+                    width=cross_width,
+                )
+                # vertical line
+                draw.line(
+                    [(cx, cy - cross_len), (cx, cy + cross_len)],
+                    fill=cross_color,
+                    width=cross_width,
+                )
+
+                # line from frame center -> target center (top detection)
+                target = detections[0]
+                x1, y1, x2, y2 = target.bbox
+                obj_cx = int((x1 + x2) / 2)
+                obj_cy = int((y1 + y2) / 2)
+
+                draw.line(
+                    [(cx, cy), (obj_cx, obj_cy)],
+                    fill="yellow",
+                    width=2,
+                )
+                draw.ellipse(
+                    [(obj_cx - 4, obj_cy - 4), (obj_cx + 4, obj_cy + 4)],
+                    outline="yellow",
+                    width=2,
+                    )
+
 
             for det in detections:
                 x1, y1, x2, y2 = det.bbox
@@ -460,7 +498,7 @@ class Processor:
         self._current_pan_output = 0.0
         self._current_tilt_output = 0.0
         self._idle_pan_positions = [-1.0, -0.5, 0.0, 0.5, 1.0]
-        self._idle_tilt_positions = [0.3, 0.6, 0.8, 1.0]
+        self._idle_tilt_positions = [0.3, 0.5, 0.6, 0.8]
         self._idle_pan_index = 0
         self._idle_pan_direction = 1
         self._idle_tilt_index = 0
@@ -499,22 +537,52 @@ class Processor:
             k=1,
         )[0]
 
-    def _compute_idle_sweep_control(self) -> tuple[float, float]:
-        pan = self._idle_pan_positions[self._idle_pan_index]
-        tilt = self._idle_tilt_positions[self._idle_tilt_index]
+    def _compute_idle_sweep_control(self, step_size: float = 0.02) -> tuple[float, float]:
+        """
+        Return smooth pan/tilt control for idle sweep.
+        step_size: max change per call (smaller = slower sweep)
+        """
+        # target point from sweep pattern
+        target_pan = self._idle_pan_positions[self._idle_pan_index]
+        target_tilt = self._idle_tilt_positions[self._idle_tilt_index]
 
-        self._idle_pan_index += self._idle_pan_direction
-        if self._idle_pan_index >= len(self._idle_pan_positions):
-            self._idle_pan_index = len(self._idle_pan_positions) - 2
-            self._idle_pan_direction = -1
-            self._idle_tilt_index = (self._idle_tilt_index + 1) % len(self._idle_tilt_positions)
-        elif self._idle_pan_index < 0:
-            self._idle_pan_index = 1
-            self._idle_pan_direction = 1
-            self._idle_tilt_index = (self._idle_tilt_index + 1) % len(self._idle_tilt_positions)
+        # initialize current output if missing
+        if not hasattr(self, "_current_pan_output"):
+            self._current_pan_output = target_pan
+        if not hasattr(self, "_current_tilt_output"):
+            self._current_tilt_output = target_tilt
 
-        self._current_pan_output = pan
-        self._current_tilt_output = tilt
+        # move current output toward target with limited step
+        pan_err = target_pan - self._current_pan_output
+        tilt_err = target_tilt - self._current_tilt_output
+
+        if abs(pan_err) <= step_size:
+            self._current_pan_output = target_pan
+        else:
+            self._current_pan_output += step_size if pan_err > 0 else -step_size
+
+        if abs(tilt_err) <= step_size:
+            self._current_tilt_output = target_tilt
+        else:
+            self._current_tilt_output += step_size if tilt_err > 0 else -step_size
+
+        # clamp
+        self._current_pan_output = max(-1.0, min(1.0, self._current_pan_output))
+        self._current_tilt_output = max(-1.0, min(1.0, self._current_tilt_output))
+
+        # advance sweep index ONLY after reaching target pan
+        if self._current_pan_output == target_pan:
+            self._idle_pan_index += self._idle_pan_direction
+
+            if self._idle_pan_index >= len(self._idle_pan_positions):
+                self._idle_pan_index = len(self._idle_pan_positions) - 2
+                self._idle_pan_direction = -1
+                self._idle_tilt_index = (self._idle_tilt_index + 1) % len(self._idle_tilt_positions)
+            elif self._idle_pan_index < 0:
+                self._idle_pan_index = 1
+                self._idle_pan_direction = 1
+                self._idle_tilt_index = (self._idle_tilt_index + 1) % len(self._idle_tilt_positions)
+
         return self._current_pan_output, self._current_tilt_output
 
     @staticmethod
@@ -538,11 +606,31 @@ class Processor:
 
         obj_cx = (x1 + x2) / 2.0
         obj_cy = (y1 + y2) / 2.0
-        error_x = (w / 2.0 - obj_cx) / (w / 2.0)
-        error_y = (h / 2.0 - obj_cy) / (h / 2.0)
+        error_x = (w / 2.0 - obj_cx) / (w / 2.0)   # -1..1
+        error_y = (h / 2.0 - obj_cy) / (h / 2.0)   # -1..1
 
-        self._current_pan_output = max(-1.0, min(1.0, self._current_pan_output + 0.2 * error_x))
-        self._current_tilt_output = max(-1.0, min(1.0, self._current_tilt_output + 0.2 * error_y))
+        # tuned gains (tilt smaller to reduce oscillation)
+        pan_k = 0.12
+        tilt_k = 0.06
+
+        # ignore tiny errors near center
+        deadband_x = 0.03
+        deadband_y = 0.06
+
+        # clamp per-update change
+        max_step_pan = 0.03
+        max_step_tilt = 0.015
+
+        if abs(error_x) < deadband_x:
+            error_x = 0.0
+        if abs(error_y) < deadband_y:
+            error_y = 0.0
+
+        pan_delta = max(-max_step_pan, min(max_step_pan, pan_k * error_x))
+        tilt_delta = max(-max_step_tilt, min(max_step_tilt, tilt_k * error_y))
+
+        self._current_pan_output = max(-1.0, min(1.0, self._current_pan_output + pan_delta))
+        self._current_tilt_output = max(-1.0, min(1.0, self._current_tilt_output - tilt_delta))
         return self._current_pan_output, self._current_tilt_output
 
     def _send_control_feedback(
@@ -614,19 +702,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="PC-side processor for OJDM")
     parser.add_argument("--pi-host", required=True, help="Pi hostname or IP")
     parser.add_argument("--model", required=True, help="Path to YOLO .pt model")
-    parser.add_argument("--conf", type=float, default=0.5, help="Confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.88, help="Confidence threshold")
     parser.add_argument("--device", default="cpu", help="Torch device (cpu/cuda/mps)")
     parser.add_argument("--video-port", type=int, default=5000, help="Video TCP port")
     parser.add_argument("--width", type=int, default=640, help="Video width")
     parser.add_argument("--height", type=int, default=480, help="Video height")
     parser.add_argument("--fps", type=int, default=10, help="Video FPS")
     parser.add_argument("--idle-interval", type=float, default=40.0, help="Idle audio interval (s)")
-    parser.add_argument("--no-detection-buffer", type=float, default=4.0, help="Detection hold buffer in seconds")
-    parser.add_argument("--detected-stop-seconds", type=float, default=13.0, help="How long to keep STOP movement in detected state")
-    parser.add_argument("--idle-forward-weight", type=float, default=0.8, help="Idle forward movement weight")
+    parser.add_argument("--no-detection-buffer", type=float, default=0.4, help="Detection hold buffer in seconds")
+    parser.add_argument("--detected-stop-seconds", type=float, default=6.0, help="How long to keep STOP movement in detected state")
+    parser.add_argument("--idle-forward-weight", type=float, default=0.75, help="Idle forward movement weight")
     parser.add_argument("--idle-backward-weight", type=float, default=0.15, help="Idle backward movement weight")
-    parser.add_argument("--idle-stop-weight", type=float, default=0.05, help="Idle stop movement weight")
-    parser.add_argument("--control-interval", type=float, default=0.2, help="Control packet send interval in seconds")
+    parser.add_argument("--idle-stop-weight", type=float, default=0.1, help="Idle stop movement weight")
+    parser.add_argument("--control-interval", type=float, default=0.01, help="Control packet send interval in seconds")
     parser.add_argument("--assets", default="assets", help="Assets base directory")
     parser.add_argument("--debug-gui", action="store_true", help="Show debug GUI with boxes")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
